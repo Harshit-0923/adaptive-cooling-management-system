@@ -1,0 +1,315 @@
+import cv2
+import numpy as np
+import random
+import time
+import os
+from ultralytics import YOLO
+
+SYSTEM_OWNER = "Students"
+SYSTEM_TITLE = f"Cooling Management System by {SYSTEM_OWNER}"
+ZONE_GRID = (2, 3)
+FAN_COUNT = 6
+LIGHT_COUNT = 6
+FAN_TIMER_DURATION = 60
+
+CONFIDENCE_THRESHOLD = 0.7
+CLASS_NAMES = ['person']
+
+REFERENCE_POINTS = [(100, 100), (300, 100), (100, 300)]
+REAL_WORLD_DIMENSIONS = (2.0, 2.0)
+
+HIGH_TEMP_THRESHOLD = 28
+MED_TEMP_THRESHOLD = 25
+LOW_TEMP_THRESHOLD = 22
+
+fan_timers = {i: {'active': False, 'start_time': 0} for i in range(FAN_COUNT)}
+previous_fan_status = ['OFF'] * FAN_COUNT
+
+CAMERA_SOURCES = {
+    "Laptop Webcam": 0,
+    "DroidCam": "http://192.168.18.22:4747/video",
+    "External Webcam": 1
+}
+
+caps = {name: cv2.VideoCapture(source) for name, source in CAMERA_SOURCES.items()}
+for cap in caps.values():
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+current_camera = "Laptop Webcam"
+
+def get_sensor_data():
+    return random.uniform(20, 35), random.uniform(30, 70)
+
+def load_yolo_model():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(script_dir, "yolov8n.pt")
+    
+    if not os.path.exists(model_path):
+        raise FileNotFoundError("YOLOv8 model file not found")
+    
+    model = YOLO(model_path)
+    return model
+
+def switch_camera(selected_camera):
+    global current_camera
+    if selected_camera in caps:
+        current_camera = selected_camera
+        print(f"Switched to: {selected_camera}")
+    else:
+        print("Invalid camera selection!")
+
+def measure_classroom_and_assign_zones(frame, reference_points, real_world_dimensions):
+    ref_width_pixels = abs(reference_points[1][0] - reference_points[0][0])
+    ref_height_pixels = abs(reference_points[2][1] - reference_points[0][1])
+    scale_x = ref_width_pixels / real_world_dimensions[0]
+    scale_y = ref_height_pixels / real_world_dimensions[1]
+
+    zone_boundaries = []
+    for i in range(ZONE_GRID[0]):
+        for j in range(ZONE_GRID[1]):
+            x1 = j * (frame.shape[1] // ZONE_GRID[1])
+            y1 = i * (frame.shape[0] // ZONE_GRID[0])
+            x2 = (j + 1) * (frame.shape[1] // ZONE_GRID[1])
+            y2 = (i + 1) * (frame.shape[0] // ZONE_GRID[0])
+            zone_boundaries.append(((x1, y1), (x2, y2)))
+
+    for zone in zone_boundaries:
+        cv2.rectangle(frame, zone[0], zone[1], (0, 255, 255), 2)
+        cv2.putText(frame, f"Zone {zone_boundaries.index(zone) + 1}", 
+                    (zone[0][0] + 10, zone[0][1] + 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    return frame, zone_boundaries
+
+def get_people_count_from_camera(cap, model):
+    zone_counts = [0] * FAN_COUNT
+    total_people = 0
+
+    ret, frame = cap.read()
+    if not ret:
+        return 0, zone_counts
+
+    frame, zone_boundaries = measure_classroom_and_assign_zones(frame, REFERENCE_POINTS, REAL_WORLD_DIMENSIONS)
+
+    height, width = frame.shape[:2]
+    
+    cv2.namedWindow('People Detection', cv2.WINDOW_NORMAL)
+    
+    zone_height = height // ZONE_GRID[0]
+    zone_width = width // ZONE_GRID[1]
+
+    results = model(frame, verbose=False)
+    
+    for result in results:
+        boxes = result.boxes.xyxy.cpu().numpy()
+        confidences = result.boxes.conf.cpu().numpy()
+        class_ids = result.boxes.cls.cpu().numpy()
+        
+        for box, confidence, class_id in zip(boxes, confidences, class_ids):
+            if confidence > CONFIDENCE_THRESHOLD and class_id == 0:
+                x1, y1, x2, y2 = map(int, box)
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+
+                zone_x = min(max(0, center_x // zone_width), ZONE_GRID[1] - 1)
+                zone_y = min(max(0, center_y // zone_height), ZONE_GRID[0] - 1)
+                zone_index = zone_y * ZONE_GRID[1] + zone_x
+
+                zone_counts[zone_index] += 1
+                total_people += 1
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f'Person (Zone {zone_index+1})', 
+                           (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 
+                           0.6, (255, 255, 0), 2)
+
+    cv2.putText(frame, f'Total People: {total_people}', (10, 30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+    cv2.putText(frame, f'Camera: {current_camera}', (10, 60), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+    cv2.imshow('People Detection', frame)
+    return total_people, zone_counts
+
+def control_cooling_and_lights(zone_counts, total_people, temperature):
+    global fan_timers, previous_fan_status
+    
+    fan_status = ['OFF'] * FAN_COUNT
+    light_status = ['OFF'] * LIGHT_COUNT
+    ac1_status = 'OFF'
+    ac2_status = 'OFF'
+    ac1_temperature = 24 
+    ac2_temperature = 24
+    current_time = time.time()
+
+    for i in range(FAN_COUNT):
+        if fan_timers[i]['active']:
+            elapsed = current_time - fan_timers[i]['start_time']
+            remaining = max(0, FAN_TIMER_DURATION - int(elapsed))
+            
+            if remaining <= 0:
+                fan_timers[i]['active'] = False
+                fan_status[i] = 'OFF'
+            else:
+                fan_status[i] = f'TIMER ({remaining}s)'
+
+    required_fans = 0
+    if total_people >= 21:
+        required_fans = 6
+    elif total_people >= 17:
+        required_fans = 5
+    elif total_people >= 13:
+        required_fans = 4
+    elif total_people >= 9:
+        required_fans = 3
+    elif total_people >= 5:
+        required_fans = 2
+    elif total_people >= 1:
+        required_fans = 1
+
+    occupied_zones = [i for i, count in enumerate(zone_counts) if count > 0]
+    
+    fans_activated = 0
+    for zone in occupied_zones:
+        if fans_activated < required_fans:
+            fan_status[zone] = 'ON'
+            fan_timers[zone]['active'] = False
+            fans_activated += 1
+
+    for zone in range(FAN_COUNT):
+        if zone_counts[zone] == 0 and previous_fan_status[zone] == 'ON':
+            if not fan_timers[zone]['active']:
+                fan_timers[zone] = {'active': True, 'start_time': current_time}
+                fan_status[zone] = f'TIMER ({FAN_TIMER_DURATION}s)'
+
+    for i, count in enumerate(zone_counts):
+        light_status[i] = 'ON' if count > 0 else 'OFF'
+
+    previous_fan_status = fan_status.copy()
+
+    if temperature > HIGH_TEMP_THRESHOLD:
+        ac1_status = 'ON'
+        ac2_status = 'ON'
+        ac1_temperature = 20
+        ac2_temperature = 20
+    elif temperature > MED_TEMP_THRESHOLD:
+        ac1_status = 'ON'
+        ac2_status = 'OFF'
+        ac1_temperature = 22
+    else:
+        ac1_status = 'OFF'
+        ac2_status = 'OFF'
+
+    return fan_status, light_status, ac1_status, ac2_status, ac1_temperature, ac2_temperature
+
+def create_status_window(fan_status, light_status, ac1_status, ac2_status, 
+                       ac1_temp, ac2_temp, temperature, humidity, total_people):
+    status_window = np.zeros((750, 800, 3), dtype=np.uint8)
+    status_window[:] = (40, 40, 40)
+    
+    cv2.namedWindow("System Status", cv2.WINDOW_NORMAL)
+    
+    current_time = time.strftime("%H:%M:%S")
+    current_date = time.strftime("%Y-%m-%d")
+    
+    cv2.putText(status_window, SYSTEM_TITLE, (30, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
+    
+    date_width = cv2.getTextSize(current_date, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0][0]
+    cv2.putText(status_window, current_date, (800 - date_width - 20, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 255, 150), 1)
+    time_width = cv2.getTextSize(current_time, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0][0]
+    cv2.putText(status_window, current_time, (800 - time_width - 20, 70), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150, 255, 150), 2)
+    
+    cv2.putText(status_window, f"Temperature: {temperature:.1f}°C", (30, 100), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(status_window, f"Humidity: {humidity:.1f}%", (300, 100), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(status_window, f"People: {total_people}", (30, 130), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 255), 1)
+    
+    ac1_color = (0, 255, 0) if ac1_status == 'ON' else (0, 0, 255)
+    ac2_color = (0, 255, 0) if ac2_status == 'ON' else (0, 0, 255)
+    
+    cv2.putText(status_window, f"AC 1: {ac1_status} ({ac1_temp}°C)", (300, 130), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, ac1_color, 1)
+    cv2.putText(status_window, f"AC 2: {ac2_status} ({ac2_temp}°C)", (500, 130), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, ac2_color, 1)
+    
+    cv2.putText(status_window, "FAN STATUS:", (30, 180), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1)
+    cv2.putText(status_window, "● ON    ⏳ TIMER    ○ OFF", (550, 180), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    for i in range(FAN_COUNT):
+        x_pos = 30 + (i % 3) * 250
+        y_pos = 220 + (i // 3) * 120
+        
+        if "ON" in fan_status[i]:
+            color = (0, 255, 0)
+            status = "ON"
+        elif "TIMER" in fan_status[i]:
+            color = (0, 255, 255)
+            status = fan_status[i]
+        else:
+            color = (0, 0, 255)
+            status = "OFF"
+            
+        cv2.circle(status_window, (x_pos + 20, y_pos), 20, color, -1)
+        cv2.putText(status_window, f"Fan {i+1}: {status}", (x_pos + 50, y_pos + 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(status_window, f"Zone {i+1}", (x_pos + 50, y_pos + 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 255), 1)
+    
+    cv2.putText(status_window, "LIGHT STATUS:", (30, 520), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1)
+    
+    for i in range(LIGHT_COUNT):
+        x_pos = 30 + (i % 3) * 250
+        y_pos = 550 + (i // 3) * 30
+        
+        status = light_status[i]
+        color = (0, 255, 0) if status == "ON" else (0, 0, 255)
+        cv2.putText(status_window, f"Light {i+1}: {status}", (x_pos, y_pos), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+    
+    cv2.putText(status_window, f"AC1 turns ON when >{MED_TEMP_THRESHOLD}°C", (30, 620), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 255), 1)
+    cv2.putText(status_window, f"Both ACs turn ON when >{HIGH_TEMP_THRESHOLD}°C", (30, 650), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 255), 1)
+    
+    cv2.putText(status_window, f"System configured by {SYSTEM_OWNER}", (30, 700), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 255), 1)
+    
+    cv2.imshow("System Status", status_window)
+
+if __name__ == '__main__':
+    model = load_yolo_model()
+
+    try:
+        while True:
+            temperature, humidity = get_sensor_data()
+            total_people, zone_counts = get_people_count_from_camera(
+                caps[current_camera], model)
+            
+            fan_status, light_status, ac1_status, ac2_status, ac1_temp, ac2_temp = control_cooling_and_lights(
+                zone_counts, total_people, temperature)
+
+            create_status_window(fan_status, light_status, ac1_status, ac2_status,
+                               ac1_temp, ac2_temp, temperature, humidity, total_people)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('1'):
+                switch_camera("Laptop Webcam")
+            elif key == ord('2'):
+                switch_camera("DroidCam")
+            elif key == ord('3'):
+                switch_camera("External Webcam")
+
+    finally:
+        for cap in caps.values():
+            cap.release()
+        cv2.destroyAllWindows()
+        print('System shutdown complete')
